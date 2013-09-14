@@ -18,6 +18,8 @@ use Config;
 
 use Perl::JIT qw(:all);
 use Perl::JIT::Types qw(:all);
+use Perl::JIT::VariableUse;
+use Perl::JIT::VariableSet;
 
 use LibJIT::API qw(:all);
 use LibJIT::PerlAPI qw(:all);
@@ -133,6 +135,8 @@ sub _jit_trees {
     my ($self, $asts) = @_;
 
     local $self->{subtrees} = [];
+    local $self->{_variable_use} = Perl::JIT::VariableUse->new;
+    local $self->{_variables} = {};
     local $self->{_fun} = my $fun = pa_create_pp($self->jit_context);
     for my $ast (@$asts) {
         $self->_jit_emit_root($ast);
@@ -437,6 +441,16 @@ sub _to_bool_value {
 
 sub _jit_emit_optree_jit_kids {
     my ($self, $ast, $type) = @_;
+    my $use = $self->optree_variables($ast);
+
+    for my $var ($self->{_variable_use}->dirty) {
+        $self->_flush_variable($var) if $use->is_read($var->get_pad_index);
+        if ($use->is_written($var->get_pad_index)) {
+            $self->{_variable_use}->set_stale($var);
+        } else {
+            $self->{_variable_use}->set_fresh($var);
+        }
+    }
 
     $self->clone->process_jit_candidates([$ast->get_kids]);
 
@@ -462,6 +476,35 @@ sub _jit_null_next {
     }
 }
 
+sub _flush_variable {
+    my ($self, $variable) = @_;
+    my $values = @{$self->{_variables}{$variable->get_pad_index}};
+
+    # the SV already contains the correct value
+    return if $values->{SCALAR->to_string}{fresh};
+
+    for my $value (values %$values) {
+        next unless $value->{fresh};
+        my $sv = $self->_jit_get_lexical_xv($variable);
+
+        # TODO mark SV value as fresh, and handle (?:) = ...
+        $self->_jit_assign_sv($sv, $value->{value}, $value->{type});
+        last;
+    }
+}
+
+sub _mark_fresh_only {
+    my ($self, $ast, $type) = @_;
+
+    # TODO
+}
+
+sub _mark_fresh_also {
+    my ($self, $ast, $type) = @_;
+
+    # TODO
+}
+
 sub _jit_emit_optree {
     my ($self, $ast) = @_;
 
@@ -479,6 +522,50 @@ sub _jit_emit_optree {
     return unless $ast->context == pj_context_scalar;
 
     return (pa_pop_sv($self->_fun), SCALAR);
+}
+
+# TODO merge into _jit_get_lexical_xv
+sub _jit_get_lexical_location {
+    my ($self, $ast, $type) = @_;
+    my $info = ($self->{_variables}{$ast->get_pad_index}{$type->to_string} ||= []);
+
+    if ($type->equals(UNSPECIFIED) && !$info->[0]) {
+        $info->[0] = $self->_jit_create_value($type);
+
+        my $fun = $self->_fun;
+        my $padix = jit_value_create_nint_constant($fun, jit_type_nint, $ast->get_pad_index);
+        my $sv = pa_get_pad_sv($fun, $padix);
+
+        jit_insn_store($fun, $info->[0], $sv);
+    } else {
+        $info->[0] ||= $self->_jit_create_value($type);
+    }
+
+    return $info;
+}
+
+# TODO merge into _jit_get_lexical_xv
+sub _jit_emit_lexical {
+    my ($self, $ast, $type) = @_;
+    my $info = $self->_jit_get_lexical_location($ast, $type);
+
+    # TODO mark variable as LVALUE/ASSIGNED/...
+    if ($self->{_variable_use}->is_fresh($ast)) {
+        if ($info->[1]) {
+            return ($info->[0], $type);
+        }
+        # TODO here we should coerce to correct type if there is
+        #      a fresh convertible value, and also consider
+        #      caching multiple versions
+    }
+
+    $info->[1] = 1;
+
+    my $perl_lex = $self->_jit_get_lexical_location($ast, UNSPECIFIED);
+
+    jit_insn_store($self->_fun, $info->[0], $self->_to_type($perl_lex->[0], UNSPECIFIED, $type));
+
+    return ($info->[0], $type);
 }
 
 sub _jit_get_lexical_declaration_xv {
@@ -523,6 +610,20 @@ sub _jit_get_global_xv {
     }
 }
 
+sub _jit_assign_value {
+    my ($self, $jit_to, $type_to, $jit_from, $type_from) = @_;
+    my $fun = $self->_fun;
+
+    if ($type_from->equals($type_to)) {
+        # TODO SV -> SV assignment can be this or an sv_set...
+        jit_insn_store($fun, $jit_to, $jit_from);
+    } elsif ($type_to->equals(UNSPECIFIED) || $type_to->equals(SCALAR)) {
+        $self->_jit_assign_sv($jit_to, $jit_from, $type_from);
+    } else {
+        die "Unable to assign ", $type_from->to_string, " to ", $type_to->to_string;
+    }
+}
+
 sub _jit_assign_sv {
     my ($self, $sv, $value, $type) = @_;
     my $fun = $self->_fun;
@@ -543,13 +644,27 @@ sub _jit_assign_sv {
 sub _jit_emit_sassign {
     my ($self, $ast, $type) = @_;
     my ($rv, $rt) = $self->_jit_emit($ast->get_right_kid, ANY);
-    my ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, SCALAR);
 
-    if (not($lt->equals(SCALAR) || $lt->equals(UNSPECIFIED))) {
-        die "can only assign to Perl scalars, got a ", $lt->to_string;
+    if ($ast->get_left_kid->get_type == pj_ttype_lexical ||
+        $ast->get_left_kid->get_type == pj_ttype_variabledeclaration) {
+        my ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, $ast->get_left_kid->get_value_type);
+
+        if ($lt->equals(SCALAR) || $lt->equals(UNSPECIFIED)) {
+            $self->_mark_fresh_only($ast->get_left_kid, SCALAR);
+            $self->_jit_assign_sv($lv, $rv, $rt);
+        } else {
+            $self->_mark_fresh_only($ast->get_left_kid, $lt);
+            $self->_jit_assign_value($lv, $lt, $rv, $rt);
+        }
+    } else {
+        my ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, SCALAR);
+
+        if (not($lt->equals(SCALAR) || $lt->equals(UNSPECIFIED))) {
+            die "can only assign to Perl scalars, got a ", $lt->to_string;
+        }
+
+        $self->_jit_assign_sv($lv, $rv, $rt);
     }
-
-    $self->_jit_assign_sv($lv, $rv, $rt);
 
     return ($lv, $lt);
 }
@@ -672,6 +787,7 @@ sub _jit_emit_binop {
         if (!$t1->equals(SCALAR)) {
             die "can only assign to Perl scalars, got a ", $t1->to_string;
         }
+        # TODO mark SV value as fresh, and handle (?:) = ...
         $self->_jit_assign_sv($v1, $res, $restype);
     }
 
@@ -898,6 +1014,86 @@ sub _concise_dump {
     require B::Concise;
     B::Concise::reset_sequence();
     B::Concise::compile('', '', $self->current_cv->object_2svref)->();
+}
+
+sub ast_variables {
+    my ($self, $ast) = @_;
+    my (@lvalue, @rvalue);
+    my $vars = Perl::JIT::VariableSet->new;
+
+    # performs a simple analysis, finding which variables are written
+    # to in an AST; this does not take into account execution flow, so
+    # for example a variable written and then read is marked as both read
+    # and written, while it might make more sense to only consider it written
+    # (because we are interested in value flow, not variables per se)
+    while (@lvalue || @rvalue) {
+        my $is_lvalue = @lvalue;
+        my $ast = @lvalue ? shift @lvalue : shift @rvalue;
+
+        # TODO substr ternary, chop, chomp, vec, read, ...
+        # might make sense to add an LVALUE/PROPAGATE_LVALUE/VIVIFY "context"
+        given ($ast->get_type) {
+            when (pj_ttype_lexical) {
+                if ($is_lvalue) {
+                    $vars->add_written($ast->get_pad_index);
+                } else {
+                    $vars->add_read($ast->get_pad_index);
+                }
+            }
+            when (pj_ttype_optree) {
+                $vars->merge($self->optree_variables($ast));
+            }
+            when (pj_ttype_op) {
+                if ($ast->op_class == pj_opc_binop) {
+                    if ($ast->get_optype == pj_binop_sassign) {
+                        push @rvalue, $ast->get_left_kid;
+                        push @lvalue, $ast->get_right_kid;
+                    } elsif ($ast->is_assignment_form) {
+                        push @rvalue, $ast->get_left_kid;
+                        push @lvalue, $ast->get_kids;
+                    } else {
+                        push @lvalue, $ast->get_kids;
+                    }
+                } elsif ($ast->op_class == pj_opc_unop) {
+                    if ($ast->get_optype == pj_unop_preinc ||
+                        $ast->get_optype == pj_unop_postinc ||
+                        $ast->get_optype == pj_unop_predec ||
+                        $ast->get_optype == pj_unop_postdec ||
+                        $ast->get_optype == pj_unop_sv_ref ||
+                        $ast->get_optype == pj_unop_sv_deref) {
+                        push @rvalue, $ast->get_kids;
+                    } else {
+                        push @lvalue, $ast->get_kids;
+                    }
+                } else {
+                    push @lvalue, $ast->get_kids;
+                }
+            }
+        }
+    }
+
+    return $vars;
+}
+
+# at some point (when we kill Optree nodes) this is going away
+# might make sense to move it to Optree nodes
+
+use B::Utils qw(walkoptree_filtered);
+
+sub optree_variables {
+    my ($self, $tree) = @_;
+    my $vars = Perl::JIT::VariableSet->new;
+
+    walkoptree_filtered(
+        $tree->get_perl_op,
+        sub { $_[0]->name eq 'padsv' },
+        sub {
+            $vars->add_read($_[0]->targ);
+            $vars->add_written($_[0]->targ);
+        }
+    );
+
+    return $vars;
 }
 
 1;
