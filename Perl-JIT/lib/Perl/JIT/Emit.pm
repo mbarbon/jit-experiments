@@ -142,6 +142,11 @@ sub _jit_trees {
         $self->_jit_emit_root($ast);
     }
 
+    for my $var ($self->{_variable_use}->dirty) {
+        # TODO only needs to flush if it is used outside the JITted tree
+        $self->_flush_variable($var);
+    }
+
     jit_insn_return($self->_fun, pa_get_op_next($self->_fun));
 
     # here it'd be nice to use custom ops, but they are registered by
@@ -284,10 +289,10 @@ sub _jit_emit {
             return $self->_jit_emit_const($ast, $type);
         }
         when (pj_ttype_lexical) {
-            return $self->_jit_get_lexical_xv($ast);
+            return $self->_jit_get_lexical($ast, $type);
         }
         when (pj_ttype_variabledeclaration) {
-            return $self->_jit_get_lexical_declaration_xv($ast);
+            return $self->_jit_get_lexical($ast, $type);
         }
         when (pj_ttype_global) {
             return $self->_jit_get_global_xv($ast);
@@ -417,7 +422,7 @@ sub _to_type {
     } elsif ($to_type->equals(UNSIGNED_INT)) {
         return $self->_to_uv($val, $type);
     } else {
-        die "Handle more coercion cases";
+        die "Handle more coercion cases ", $type->to_string, ' to ', $to_type->to_string;
     }
 }
 
@@ -429,7 +434,7 @@ sub _to_bool {
     } elsif ($type->is_xv || $type->is_opaque) {
         return (pa_sv_true($self->_fun, $val), INT);
     } else {
-        die "Handle more coercion cases";
+        die "Handle more coercion cases ", $type->to_string;
     }
 }
 
@@ -478,31 +483,38 @@ sub _jit_null_next {
 
 sub _flush_variable {
     my ($self, $variable) = @_;
-    my $values = @{$self->{_variables}{$variable->get_pad_index}};
+    my $values = $self->{_variables}{$variable->get_pad_index};
 
     # the SV already contains the correct value
     return if $values->{SCALAR->to_string}{fresh};
 
     for my $value (values %$values) {
         next unless $value->{fresh};
-        my $sv = $self->_jit_get_lexical_xv($variable);
+        my ($sv, undef) = $self->_jit_get_lexical_xv($variable);
 
         # TODO mark SV value as fresh, and handle (?:) = ...
+        $self->_mark_fresh_only($variable, $sv, SCALAR);
         $self->_jit_assign_sv($sv, $value->{value}, $value->{type});
         last;
     }
 }
 
 sub _mark_fresh_only {
-    my ($self, $ast, $type) = @_;
+    my ($self, $variable, $value, $type) = @_;
+    my $values = $self->{_variables}{$variable->get_pad_index} ||= {};
 
-    # TODO
+    for my $value (values %$values) {
+        $value->{fresh} = 0;
+    }
+
+    $values->{$type->to_string} = {type => $type, value => $value, fresh => 1};
 }
 
 sub _mark_fresh_also {
-    my ($self, $ast, $type) = @_;
+    my ($self, $variable, $value, $type) = @_;
+    my $values = $self->{_variables}{$variable->get_pad_index} ||= {};
 
-    # TODO
+    $values->{$type->to_string} = {type => $type, value => $value, fresh => 1};
 }
 
 sub _jit_emit_optree {
@@ -524,48 +536,34 @@ sub _jit_emit_optree {
     return (pa_pop_sv($self->_fun), SCALAR);
 }
 
-# TODO merge into _jit_get_lexical_xv
-sub _jit_get_lexical_location {
+sub _jit_get_lexical {
     my ($self, $ast, $type) = @_;
-    my $info = ($self->{_variables}{$ast->get_pad_index}{$type->to_string} ||= []);
 
-    if ($type->equals(UNSPECIFIED) && !$info->[0]) {
-        $info->[0] = $self->_jit_create_value($type);
-
-        my $fun = $self->_fun;
-        my $padix = jit_value_create_nint_constant($fun, jit_type_nint, $ast->get_pad_index);
-        my $sv = pa_get_pad_sv($fun, $padix);
-
-        jit_insn_store($fun, $info->[0], $sv);
-    } else {
-        $info->[0] ||= $self->_jit_create_value($type);
-    }
-
-    return $info;
-}
-
-# TODO merge into _jit_get_lexical_xv
-sub _jit_emit_lexical {
-    my ($self, $ast, $type) = @_;
-    my $info = $self->_jit_get_lexical_location($ast, $type);
-
-    # TODO mark variable as LVALUE/ASSIGNED/...
-    if ($self->{_variable_use}->is_fresh($ast)) {
-        if ($info->[1]) {
-            return ($info->[0], $type);
+    if ($type->equals(SCALAR) || $type->equals(UNSPECIFIED)) {
+        if ($ast->get_type == pj_ttype_variabledeclaration) {
+            return ($self->_jit_get_lexical_declaration_xv($ast), $type);
+        } else {
+            return ($self->_jit_get_lexical_xv($ast), $type);
         }
-        # TODO here we should coerce to correct type if there is
-        #      a fresh convertible value, and also consider
-        #      caching multiple versions
+    } else {
+        my $values = $self->{_variables}{$ast->get_pad_index} ||= {};
+
+        if (my $cached = $values->{$type->to_string}) {
+            return ($cached->{value}, $cached->{type});
+        }
+
+        my ($sv, $svtype) = $self->_jit_get_lexical($ast, SCALAR);
+
+        # TODO here we could do NV -> IV conversion where appropriate,
+        #      but keep things simple for now...
+        my $value = $self->_jit_create_value($type);
+        my ($coerced, $ctype) = $self->_to_type($sv, $svtype, $type);
+
+        jit_insn_store($self->_fun, $value, $coerced);
+        $self->_mark_fresh_also($ast, $value, $ctype);
+
+        return ($value, $ctype);
     }
-
-    $info->[1] = 1;
-
-    my $perl_lex = $self->_jit_get_lexical_location($ast, UNSPECIFIED);
-
-    jit_insn_store($self->_fun, $info->[0], $self->_to_type($perl_lex->[0], UNSPECIFIED, $type));
-
-    return ($info->[0], $type);
 }
 
 sub _jit_get_lexical_declaration_xv {
@@ -614,11 +612,14 @@ sub _jit_assign_value {
     my ($self, $jit_to, $type_to, $jit_from, $type_from) = @_;
     my $fun = $self->_fun;
 
-    if ($type_from->equals($type_to)) {
-        # TODO SV -> SV assignment can be this or an sv_set...
-        jit_insn_store($fun, $jit_to, $jit_from);
-    } elsif ($type_to->equals(UNSPECIFIED) || $type_to->equals(SCALAR)) {
+    if ($type_to->equals(UNSPECIFIED) || $type_to->equals(SCALAR)) {
         $self->_jit_assign_sv($jit_to, $jit_from, $type_from);
+    } elsif ($type_from->equals($type_to)) {
+        jit_insn_store($fun, $jit_to, $jit_from);
+    } elsif ($type_from->is_numeric && $type_to->is_numeric) {
+        my ($value, undef) = $self->_to_type($jit_from, $type_from, $type_to);
+
+        jit_insn_store($fun, $jit_to, $value);
     } else {
         die "Unable to assign ", $type_from->to_string, " to ", $type_to->to_string;
     }
@@ -644,25 +645,23 @@ sub _jit_assign_sv {
 sub _jit_emit_sassign {
     my ($self, $ast, $type) = @_;
     my ($rv, $rt) = $self->_jit_emit($ast->get_right_kid, ANY);
+    my ($lv, $lt);
 
     if ($ast->get_left_kid->get_type == pj_ttype_lexical ||
         $ast->get_left_kid->get_type == pj_ttype_variabledeclaration) {
-        my ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, $ast->get_left_kid->get_value_type);
+        ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, $ast->get_left_kid->get_value_type);
 
-        if ($lt->equals(SCALAR) || $lt->equals(UNSPECIFIED)) {
-            $self->_mark_fresh_only($ast->get_left_kid, SCALAR);
-            $self->_jit_assign_sv($lv, $rv, $rt);
-        } else {
-            $self->_mark_fresh_only($ast->get_left_kid, $lt);
-            $self->_jit_assign_value($lv, $lt, $rv, $rt);
-        }
+        $self->{_variable_use}->set_dirty($ast->get_left_kid);
+        $self->_mark_fresh_only($ast->get_left_kid, $lv, $lt);
+        $self->_jit_assign_value($lv, $lt, $rv, $rt);
     } else {
-        my ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, SCALAR);
+        ($lv, $lt) = $self->_jit_emit($ast->get_left_kid, SCALAR);
 
         if (not($lt->equals(SCALAR) || $lt->equals(UNSPECIFIED))) {
             die "can only assign to Perl scalars, got a ", $lt->to_string;
         }
 
+        # TODO handle ternary, substr(), vec(), ...
         $self->_jit_assign_sv($lv, $rv, $rt);
     }
 
@@ -783,12 +782,19 @@ sub _jit_emit_binop {
     }
 
     if ($ast->is_assignment_form) {
+        my $lk = $ast->get_left_kid;
         # TODO proper LVALUE treatment
-        if (!$t1->equals(SCALAR)) {
+        if ($lk->get_type == pj_ttype_lexical ||
+            $lk->get_type == pj_ttype_variabledeclaration) {
+            $self->{_variable_use}->set_dirty($lk);
+            $self->_mark_fresh_only($lk, $v1, $t1);
+            $self->_jit_assign_value($v1, $t1, $res, $restype);
+        } elsif ($t1->equals(SCALAR)) {
+            # TODO handle ternary, substr(), vec(), ...
+            $self->_jit_assign_sv($v1, $res, $restype);
+        } else {
             die "can only assign to Perl scalars, got a ", $t1->to_string;
         }
-        # TODO mark SV value as fresh, and handle (?:) = ...
-        $self->_jit_assign_sv($v1, $res, $restype);
     }
 
     return ($res, $restype);
