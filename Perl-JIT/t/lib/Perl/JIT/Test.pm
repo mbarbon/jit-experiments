@@ -25,6 +25,7 @@ our @EXPORT = qw(
   run_jit_tests
   count_jit_tests
   build_jit_test_sub
+  build_jit_typed_test_sub
   build_jit_types_test_sub
   concise_dump
 );
@@ -287,6 +288,28 @@ sub build_jit_test_sub {
   my $sub;
   my $ok = eval $subcode;
   if (!$ok) {
+    my $err = $@ || 'Zombie error';
+    die "Failed to compile test function code:\n$subcode";
+  }
+  return $sub;
+}
+
+sub build_jit_typed_test_sub {
+  my ($type, $params, $code, $retval) = @_;
+  my $decl = $type ? "typed $type" : "my";
+  my $subcode = <<EOT;
+  use Perl::JIT;
+
+  sub {
+    $decl ($params) = \@_;
+
+    $code;
+
+    return $retval;
+  }
+EOT
+  my $sub = eval $subcode;
+  if (!$sub) {
     my $err = $@ || 'Zombie error';
     die "Failed to compile test function code:\n$subcode";
   }
